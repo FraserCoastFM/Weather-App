@@ -1,0 +1,305 @@
+import requests
+import random
+import tkinter as tk
+import threading
+import queue
+import time
+import google.generativeai as genai
+import pygame
+from colorama import Fore, init
+from google.cloud import texttospeech
+
+init(autoreset=True)
+
+# API Configuration
+TOMORROW_API_KEY = "dG7oh4gfF3gKyH2wHtDLlwfwp9PPK5dz"
+GEMINI_API_KEY = "AIzaSyDDOiQxm68rHUgRHjjmxaLHebu7lf6y9Cc"
+GOOGLE_TTS_KEY = "AIzaSyBy4_tlzRJwMMs-u4ZeQ49-46K5jXfTPG0"
+
+# Initialize services
+genai.configure(api_key=GEMINI_API_KEY)
+gemini = genai.GenerativeModel('gemini-pro')
+tts_client = texttospeech.TextToSpeechClient(client_options={'api_key': GOOGLE_TTS_KEY})
+
+# Location Data
+locations = {
+    'Maryborough': {'lat': -25.532, 'lon': 152.701},
+    'Hervey Bay': {'lat': -25.290, 'lon': 152.844}
+}
+
+# Wind Direction Conversion
+DIRECTION_RANGES = {
+    'Northerly': (348.75, 360),
+    'North-Northeasterly': (11.25, 33.75),
+    'Northeasterly': (33.75, 56.25),
+    'East-Northeasterly': (56.25, 78.75),
+    'Easterly': (78.75, 101.25),
+    'East-Southeasterly': (101.25, 123.75),
+    'Southeasterly': (123.75, 146.25),
+    'South-Southeasterly': (146.25, 168.75),
+    'Southerly': (168.75, 191.25),
+    'South-Southwesterly': (191.25, 213.75),
+    'Southwesterly': (213.75, 236.25),
+    'West-Southwesterly': (236.25, 258.75),
+    'Westerly': (258.75, 281.25),
+    'West-Northwesterly': (281.25, 303.75),
+    'Northwesterly': (303.75, 326.25),
+    'North-Northwesterly': (326.25, 348.75)
+}
+
+# Application Constants
+VERSION = "2.2.0"
+GUI_UPDATE_QUEUE = queue.Queue()
+current_analysis = ""
+
+# Phrase variations
+PHRASE_VARIANTS = {
+    'temperature': [
+        "Current temperature: {temp}°C",
+        "Thermometer reading {temp}°C",
+        "Sitting at {temp} degrees Celsius"
+    ],
+    'humidity': [
+        "Humidity level {humidity}%",
+        "Air moisture at {humidity}%",
+        "{humidity} percent humidity"
+    ],
+    'wind': [
+        "{wind_speed} km/h winds from the {wind_dir}",
+        "Winds {wind_dir} at {wind_speed} km/h",
+        "{wind_dir} breezes at {wind_speed} km/h"
+    ],
+    'uv': [
+        "UV index currently {uv}",
+        "Sun's UV intensity: {uv}",
+        "UV rating at {uv}"
+    ]
+}
+
+def log_message(message, log_file="app_log.txt"):
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    full_message = f"[{timestamp}] {message}"
+    print(Fore.YELLOW + full_message)
+    with open(log_file, "a") as file:
+        file.write(full_message + "\n")
+
+def degrees_to_direction(degrees):
+    degrees = degrees % 360
+    for direction, (start, end) in DIRECTION_RANGES.items():
+        if start <= degrees <= end:
+            return direction
+    return "unknown direction"
+
+def text_to_speech(text):
+    try:
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-AU",
+            name="en-AU-News-F",
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.1
+        )
+        response = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        with open("temp_audio.mp3", "wb") as out:
+            out.write(response.audio_content)
+            
+        pygame.mixer.init()
+        pygame.mixer.music.load("temp_audio.mp3")
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.1)
+            
+    except Exception as e:
+        log_message(f"TTS Error: {str(e)}", "error_log.txt")
+
+def fetch_weather(city, lat, lon):
+    try:
+        log_message(f"Fetching weather for {city}...")
+        url = "https://api.tomorrow.io/v4/timelines"
+        params = {
+            'location': f'{lat},{lon}',
+            'fields': ['temperature', 'humidity', 'windDirection', 'windSpeed', 'uvIndex'],
+            'timesteps': 'current',
+            'apikey': TOMORROW_API_KEY
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        interval = data['data']['timelines'][0]['intervals'][0]
+        values = interval['values']
+        
+        return (
+            round(values['temperature'], 1),
+            round(values['humidity']),
+            degrees_to_direction(values['windDirection']),
+            round(values['windSpeed'] * 3.6),
+            values.get('uvIndex', 0)
+        )
+        
+    except Exception as e:
+        log_message(f"Error fetching {city} weather: {str(e)}", "error_log.txt")
+        return None, None, None, None, None
+
+def generate_weather_phrase(city, temp, humidity, wind_dir, wind_speed, uv):
+    template = random.choice([
+        "Weather update for {city}: {temp}. {humidity}. {wind}. {uv}.",
+        "Current conditions in {city}: {temp}, {humidity}, {wind}, and {uv}.",
+        "{city} weather: {temp} | {humidity} | {wind} | {uv}."
+    ])
+    
+    return template.format(
+        city=city,
+        temp=random.choice(PHRASE_VARIANTS['temperature']).format(temp=temp),
+        humidity=random.choice(PHRASE_VARIANTS['humidity']).format(humidity=humidity),
+        wind=random.choice(PHRASE_VARIANTS['wind']).format(wind_dir=wind_dir, wind_speed=wind_speed),
+        uv=random.choice(PHRASE_VARIANTS['uv']).format(uv=uv)
+    )
+
+def analyze_with_gemini():
+    global current_analysis
+    try:
+        with open("weather_log.txt", "r") as f:
+            weather_data = f.read()
+        
+        if not weather_data:
+            error_msg = "\nNo weather data to analyze!\n"
+            GUI_UPDATE_QUEUE.put((error_msg, "gemini_analysis.txt"))
+            return
+
+        prompt = f"""Analyze this weather data and provide insights:
+        {weather_data}
+        Include:
+        1. Temperature trends
+        2. Humidity patterns
+        3. Wind analysis
+        4. UV index implications
+        5. Safety recommendations"""
+        
+        response = gemini.generate_content(prompt)
+        current_analysis = response.text
+        analysis_text = f"\n=== AI Analysis ===\n{current_analysis}\n===================\n"
+        GUI_UPDATE_QUEUE.put((analysis_text, "gemini_analysis.txt"))
+        
+    except Exception as e:
+        error_msg = f"\nAnalysis failed: {str(e)}\n"
+        GUI_UPDATE_QUEUE.put((error_msg, "gemini_analysis.txt"))
+        log_message(error_msg, "error_log.txt")
+
+def read_analysis():
+    if current_analysis:
+        threading.Thread(target=text_to_speech, args=(current_analysis,)).start()
+    else:
+        GUI_UPDATE_QUEUE.put(("\nNo analysis available to read!\n", "gemini_analysis.txt"))
+
+def process_gui_updates(text_widget):
+    while not GUI_UPDATE_QUEUE.empty():
+        message, output_file = GUI_UPDATE_QUEUE.get()
+        text_widget.insert(tk.END, message)
+        text_widget.yview(tk.END)
+        with open(output_file, "a") as f:
+            f.write(message)
+        GUI_UPDATE_QUEUE.task_done()
+    text_widget.after(100, process_gui_updates, text_widget)
+
+def create_gui():
+    window = tk.Tk()
+    window.title("Australian Weather Reporter")
+    window.configure(bg="#2e2e2e")
+    
+    text_area = tk.Text(
+        window, 
+        wrap=tk.WORD,
+        height=15,
+        width=60,
+        font=("Consolas", 12),
+        fg="white",
+        bg="#2e2e2e",
+        insertbackground="white"
+    )
+    text_area.pack(padx=20, pady=20)
+    
+    scrollbar = tk.Scrollbar(window, command=text_area.yview)
+    text_area.config(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    return window, text_area
+
+def main():
+    log_message(f"\n{' Weather Station ':=^80}")
+    log_message(f"Version {VERSION} | Initializing systems...")
+    
+    window, text_area = create_gui()
+    output_file = "weather_log.txt"
+    
+    text_area.after(100, process_gui_updates, text_area)
+    
+    def fetch_all_weather():
+        for city, coords in locations.items():
+            threading.Thread(
+                target=lambda: process_city_weather(city, coords, output_file),
+                daemon=True
+            ).start()
+    
+    def process_city_weather(city, coords, log_file):
+        temp, hum, wind_dir, wind_speed, uv = fetch_weather(city, coords['lat'], coords['lon'])
+        if all([temp, hum, wind_dir, wind_speed, uv]):
+            phrase = generate_weather_phrase(city, temp, hum, wind_dir, wind_speed, uv)
+            GUI_UPDATE_QUEUE.put((f"{phrase}\n\n", log_file))
+            text_to_speech(phrase)
+            log_message(f"Announced weather for {city}")
+    
+    button_frame = tk.Frame(window, bg="#2e2e2e")
+    button_frame.pack(pady=10)
+    
+    buttons = [
+        ("Get Weather", "#4CAF50", fetch_all_weather),
+        ("Random Example", "#2196F3", lambda: threading.Thread(
+            target=generate_random_example, args=(output_file,), daemon=True).start()),
+        ("AI Analysis", "#9C27B0", analyze_with_gemini),
+        ("Read Analysis", "#FF9800", read_analysis)
+    ]
+    
+    for text, color, command in buttons:
+        tk.Button(
+            button_frame,
+            text=text,
+            command=command,
+            font=("Helvetica", 12, "bold"),
+            fg="white",
+            bg=color,
+            relief="flat",
+            width=12
+        ).pack(side=tk.LEFT, padx=5)
+    
+    window.geometry("800x600")
+    window.mainloop()
+
+def generate_random_example(output_file):
+    try:
+        city = random.choice(list(locations.keys()))
+        temp = random.uniform(15, 35)
+        humidity = random.randint(40, 90)
+        wind_dir = random.choice(list(DIRECTION_RANGES.keys()))
+        wind_speed = random.randint(10, 40)
+        uv = random.randint(0, 11)
+        
+        phrase = generate_weather_phrase(city, round(temp, 1), humidity, wind_dir, wind_speed, uv)
+        GUI_UPDATE_QUEUE.put((f"{phrase}\n\n", output_file))
+        text_to_speech(phrase)
+        log_message(f"Generated random example for {city}")
+        
+    except Exception as e:
+        log_message(f"Random example error: {str(e)}", "error_log.txt")
+
+if __name__ == "__main__":
+    main()
